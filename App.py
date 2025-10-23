@@ -1,15 +1,16 @@
 import streamlit as st
 import base64
 import json
+import requests # Requerido para la llamada HTTP
 import time
 import io
 from PIL import Image
 from streamlit_drawable_canvas import st_canvas
 
 # --- Configuraciones del LLM para el entorno ---
-# Usamos la API de Gemini (disponible internamente) para la generación de respuestas.
 GEMINI_CHAT_MODEL = "gemini-2.5-flash-preview-09-2025" 
-API_KEY = "" # Clave dejada vacía para que sea provista por el entorno de Canvas
+# La clave se leerá desde el input, no desde el entorno.
+# Se añade el 'requests' package para resolver el AttributeError
 
 # --- CSS GÓTICO (Paleta Arcano-Escarlata) ---
 gothic_css = """
@@ -96,17 +97,19 @@ div[data-testid="stMarkdownContainer"] {
 st.markdown(gothic_css, unsafe_allow_html=True)
 
 
-# --- Funciones de Utilidad (Uso de st.legacy_fetch para la API de Gemini) ---
+# --- Funciones de Utilidad (Uso de 'requests' para la API de Gemini) ---
 
-def safe_fetch(url, method='POST', headers=None, body=None, max_retries=3, delay=1):
-    """Realiza llamadas a la API con reintentos y retroceso exponencial usando st.legacy_fetch."""
+def safe_fetch_request(url, api_key, method='POST', headers=None, body=None, max_retries=3, delay=1):
+    """Realiza llamadas a la API con reintentos y retroceso exponencial usando 'requests'."""
     if headers is None:
         headers = {'Content-Type': 'application/json'}
     
+    # Agregar la clave API a la URL
+    url_with_key = f"{url}?key={api_key}"
+    
     for attempt in range(max_retries):
         try:
-            # Usar st.legacy_fetch (síncrona)
-            response = st.legacy_fetch(url, method=method, headers=headers, body=body)
+            response = requests.request(method, url_with_key, headers=headers, data=body, timeout=30)
             
             if response.status_code == 200:
                 return response.json()
@@ -115,7 +118,12 @@ def safe_fetch(url, method='POST', headers=None, body=None, max_retries=3, delay
                 continue
             else:
                 error_detail = response.text if response.text else f"Código de estado: {response.status_code}"
-                raise Exception(f"Fallo en la llamada a la API. {error_detail}")
+                raise Exception(f"Fallo en la llamada a la API ({response.status_code}). {error_detail}")
+        except requests.exceptions.RequestException as e:
+            if attempt < max_retries - 1:
+                time.sleep(delay * (2 ** attempt))
+                continue
+            raise Exception(f"Error de red/conexión: {e}")
         except Exception as e:
             if attempt < max_retries - 1:
                 time.sleep(delay * (2 ** attempt))
@@ -124,7 +132,7 @@ def safe_fetch(url, method='POST', headers=None, body=None, max_retries=3, delay
     raise Exception("Llamada a la API fallida después de múltiples reintentos.")
 
 
-def get_gemini_vision_answer(base64_image: str, mime_type: str, user_prompt: str) -> str:
+def get_gemini_vision_answer(base64_image: str, mime_type: str, user_prompt: str, api_key: str) -> str:
     """Invoca la API de Gemini para análisis de visión."""
     
     # Construcción del payload
@@ -145,9 +153,9 @@ def get_gemini_vision_answer(base64_image: str, mime_type: str, user_prompt: str
         ]
     }
     
-    apiUrl = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_CHAT_MODEL}:generateContent?key={API_KEY}"
+    apiUrl = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_CHAT_MODEL}:generateContent"
 
-    response_data = safe_fetch(apiUrl, body=json.dumps(payload))
+    response_data = safe_fetch_request(apiUrl, api_key, body=json.dumps(payload))
     
     # Manejo de la respuesta
     candidate = response_data.get('candidates', [{}])[0]
@@ -168,9 +176,7 @@ st.markdown("---")
 
 # Input para la API Key (Sello Arcano)
 ke = st.text_input('Ingresa el Sello Arcano (Clave API)', type="password", key="api_key_input")
-if ke:
-    pass # Simulamos que la clave se aplica al entorno.
-else:
+if not ke:
     st.info("Introduce el Sello Arcano para dotar de Visión al Ojo.")
 
 
@@ -181,7 +187,6 @@ st.markdown("Dibuja un único dígito (0-9) en el papiro negro para invocar su s
 
 # Parámetros del Canvas
 drawing_mode = "freedraw"
-# stroke_width y stroke_color son ajustados para ser visibles en el fondo oscuro
 stroke_width = st.slider('Define la Pluma del Símbolo (Ancho de Línea)', 1, 30, 15)
 stroke_color = '#FFFFFF' # Color de trazo blanco (visible)
 bg_color = '#000000' # Fondo negro (como la pizarra)
@@ -198,12 +203,10 @@ canvas_result = st_canvas(
 
 
 # Toggle para la pregunta específica (Invocación de Contexto)
-# Se mantiene, pero la pregunta es sobre el dígito.
 show_details = st.toggle("Invocar Profundización de Análisis", value=False)
 
 additional_details = ""
 if show_details:
-    # Text input para detalles adicionales
     additional_details = st.text_area(
         "Dicta la Pregunta Específica sobre el Dígito:",
         placeholder="Ej: ¿Qué posibles significados esotéricos podría tener este símbolo?",
@@ -222,7 +225,7 @@ if canvas_result.image_data is not None and analyze_button:
         st.warning("El Sello Arcano es obligatorio para invocar la Visión. Por favor, ingrésalo.")
         st.stop()
         
-    # Verificar si el dibujo está vacío (completamente negro o transparente)
+    # Verificar si el dibujo está vacío
     if not canvas_result.image_data.any():
         st.warning("El papiro está en blanco. Por favor, traza un símbolo numérico.")
         st.stop()
@@ -230,17 +233,12 @@ if canvas_result.image_data is not None and analyze_button:
     with st.spinner("El Ojo del Arcano se está abriendo para descifrar el símbolo..."):
         try:
             # 1. Preparar la Reliquia (Codificación Base64)
-            
-            # Convertir array RGBA de NumPy a imagen PIL
             input_numpy_array = canvas_result.image_data
-            input_image = Image.fromarray(input_numpy_array.astype('uint8'), 'RGBA')
-            
-            # Convertir a RGB (o dejarlo en escala de grises si fuera para ML, pero RGB funciona para Gemini Vision)
-            rgb_image = input_image.convert('RGB')
+            input_image = Image.fromarray(input_numpy_array.astype('uint8'), 'RGBA').convert('RGB')
             
             # Guardar en memoria como PNG para Base64
             buf = io.BytesIO()
-            rgb_image.save(buf, format='PNG')
+            input_image.save(buf, format='PNG')
             file_bytes = buf.getvalue()
             
             base64_image = base64.b64encode(file_bytes).decode("utf-8")
@@ -259,7 +257,7 @@ if canvas_result.image_data is not None and analyze_button:
                 )
             
             # 3. Invocar la Visión
-            response = get_gemini_vision_answer(base64_image, mime_type, prompt_text)
+            response = get_gemini_vision_answer(base64_image, mime_type, prompt_text, ke)
             
             # 4. Mostrar la Revelación
             st.markdown("### 📜 La Revelación del Oráculo:")
@@ -272,4 +270,5 @@ else:
     # Mensajes de estado
     if analyze_button and canvas_result.image_data is None:
         st.warning("El Canvas no ha sido inicializado o no contiene datos.")
+
 
